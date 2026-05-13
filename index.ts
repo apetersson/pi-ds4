@@ -49,6 +49,12 @@ const SERVER_CLIENT_HOST = SERVER_BIND_HOST === "0.0.0.0" ? "127.0.0.1" : SERVER
 const DEFAULT_SERVER_PORT = 8000;
 const AUTO_PORT_SCAN_COUNT = parseScanCount(process.env.DS4_AUTO_PORT_SCAN_COUNT);
 
+// Token context size for the ds4-server KV cache. Must match the model's
+// trained context window. Both the server arg and pi's model registration
+// derive from this single source of truth to stay in sync.
+//const DS4_CTX = 402432;
+const DS4_CTX = 398000;
+
 function syncProcessArgs(pid: number): string | undefined {
 	const result = spawnSync("ps", ["-p", String(pid), "-o", "args="], { encoding: "utf8", timeout: 2_000 });
 	return result.status === 0 ? result.stdout.trim() : undefined;
@@ -123,7 +129,7 @@ function serverArgsForPort(port: number): string[] {
 		"--port",
 		String(port),
 		"--ctx",
-		"100000",
+		String(DS4_CTX),
 		"--kv-disk-dir",
 		KV_DIR,
 		"--kv-disk-space-mb",
@@ -946,7 +952,12 @@ function formatRuntimeUpdateStatus(status: RuntimeUpdateStatus): string {
 	const current = status.current!.slice(0, 12);
 	const remote = status.remote!.slice(0, 12);
 	const dirty = status.dirty ? "; local tracked modifications present" : "";
-	if (status.current !== status.remote) return `ds4 runtime update available: ${current} -> ${remote}${dirty}`;
+	if (status.current !== status.remote) {
+		const hint = status.dirty
+			? " — use /ds4-update force to discard changes and update"
+			: " — use /ds4-update apply to update";
+		return `ds4 runtime update available: ${current} -> ${remote}${dirty}${hint}`;
+	}
 	return `ds4 runtime is up to date at ${current}${dirty}`;
 }
 
@@ -955,6 +966,41 @@ async function managedServerIsRunning(): Promise<boolean> {
 	// miss a concurrent startup/shutdown but cannot delay the update command exit.
 	const state = await readJson<ServerState>(STATE_FILE);
 	return !!state?.pid && state.managedBy === MANAGED_BY && isPidAlive(state.pid);
+}
+
+async function countActiveLeases(): Promise<number> {
+	try {
+		const entries = await readdir(CLIENT_DIR);
+		let count = 0;
+		for (const entry of entries) {
+			if (!entry.endsWith(".json")) continue;
+			const lease = await readJson<Lease>(join(CLIENT_DIR, entry));
+			if (await isLeaseForLiveProcess(lease)) count++;
+		}
+		return count;
+	} catch {
+		return 0;
+	}
+}
+
+async function restartManagedServer(runtimeDir: string, onStatus?: StatusCallback): Promise<void> {
+	onStatus?.("restarting ds4-server with updated binary");
+
+	const state = await readJson<ServerState>(STATE_FILE);
+	const oldPid = state?.pid;
+
+	if (oldPid && isPidAlive(oldPid)) {
+		onStatus?.("stopping old ds4-server");
+		process.kill(oldPid, "SIGTERM");
+		if (!(await waitForPidExit(oldPid, 10_000))) {
+			process.kill(oldPid, "SIGKILL");
+		}
+		await clearState();
+	}
+
+	await startServerLocked(runtimeDir);
+	await waitForServerReady(onStatus);
+	onStatus?.("ds4-server restarted with updated binary");
 }
 
 async function updateRuntime(onStatus?: StatusCallback, force = false): Promise<RuntimeUpdateStatus> {
@@ -1337,7 +1383,17 @@ function registerDs4Command(pi: ExtensionAPI): void {
 					const status = await updateRuntime(onStatus, action === "force");
 					ctx.ui.notify(formatRuntimeUpdateStatus(status), "info");
 					if (await managedServerIsRunning()) {
-						ctx.ui.notify("ds4 runtime rebuilt; restart ds4-server to use the new binary", "warning");
+						// Own lease counts as active; only safe to restart when no other pi
+						// process holds a lease (no active conversations to disrupt).
+						const otherLeases = Math.max(0, (await countActiveLeases()) - 1);
+						if (otherLeases <= 0) {
+							await restartManagedServer(status.runtimeDir, onStatus);
+							ctx.ui.notify("ds4 runtime rebuilt; server restarted with new binary", "info");
+						} else {
+							ctx.ui.notify(
+								`ds4 runtime rebuilt; will apply after ${otherLeases} active conversation${otherLeases === 1 ? "" : "s"} finishes and the server restarts`, "info",
+							);
+						}
 					}
 					return;
 				}
@@ -1411,8 +1467,8 @@ function registerDs4Provider(pi: ExtensionAPI): void {
 					xhigh: "xhigh",
 				},
 				input: ["text"],
-				contextWindow: 100000,
-				maxTokens: 384000,
+				contextWindow: DS4_CTX,
+				maxTokens: DS4_CTX,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			},
 		],
