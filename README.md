@@ -11,8 +11,9 @@ and stops the server via a bundled watchdog when no clients are left.
 ## Requirements and Behavior
 
 You will need a mac with at least 128GB of RAM.  The way this is set up right now
-is that it will install the 2-bit quantized model if you have 128GB of RAM and
-it will pick the 4-bit quantized model if you have 256GB or more.
+is that it will install the preferred 2-bit imatrix quantized model if you have
+128GB of RAM and it will pick the preferred 4-bit imatrix quantized model if you
+have 256GB or more.
 
 If you are signed into huggingface then your token is used for faster downloads.
 The server is compiled/started and models are downloaded automatically on first
@@ -57,7 +58,7 @@ Environment overrides:
 - `DS4_SUPPORT_REPO`: runtime repo URL (default `https://github.com/antirez/ds4`)
 - `DS4_SUPPORT_BRANCH`: runtime branch (default `main`)
 - `DS4_RUNTIME_DIR`: use an existing ds4 checkout instead of `~/.pi/ds4/support`
-- `DS4_MODEL_QUANT`: force `q2` or `q4` (otherwise picked from system memory)
+- `DS4_MODEL_QUANT`: force `q2-imatrix`, `q4-imatrix`, `q2`, or `q4` (otherwise the imatrix variant is picked from system memory)
 - `DS4_READY_TIMEOUT_MS`: server startup timeout
 - `DS4_SERVER_BINARY`: custom `ds4-server` binary path
 - `DS4_PORT`: force the local `ds4-server` port. Without it, pi-ds4 reuses an
@@ -69,6 +70,9 @@ Environment overrides:
   `20`, so the default scan range is 8000-8019). If no port in the range is free,
   set `DS4_PORT` explicitly. The selected port is fixed once the watchdog starts;
   restart pi to change it.
+
+The extension registers `ds4/deepseek-v4-flash` (auto quant, imatrix by default)
+and `ds4/deepseek-v4-flash-q2-imatrix` (explicit q2 imatrix).
 
 Use `/ds4` inside pi to show the live ds4 log.
 
