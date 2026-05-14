@@ -1,7 +1,9 @@
 import type { ExtensionAPI, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { execFile, spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
+
 import { spawnSync } from "node:child_process";
+
 import { closeSync, constants, openSync, readFileSync, writeSync } from "node:fs";
 import {
 	access,
@@ -34,6 +36,7 @@ const MANAGED_BY = "pi-sd4-provider";
 const DS4_SERVER_ARGS_RE = /(^|[/\s])ds4-server(\s|$)/;
 
 const DS4_DIR = join(homedir(), ".pi", "ds4");
+const SETTINGS_FILE = join(DS4_DIR, "settings.json");
 const KV_DIR = join(DS4_DIR, "kv");
 const SUPPORT_DIR = join(DS4_DIR, "support");
 const CLIENT_DIR = join(DS4_DIR, "clients");
@@ -42,13 +45,81 @@ const STATE_FILE = join(DS4_DIR, "server.json");
 const LOG_FILE = join(DS4_DIR, "log");
 const LEASE_FILE = join(CLIENT_DIR, `${process.pid}.json`);
 
-const SUPPORT_REPO = process.env.DS4_SUPPORT_REPO ?? "https://github.com/antirez/ds4";
-const SUPPORT_BRANCH = process.env.DS4_SUPPORT_BRANCH ?? "main";
+type Ds4Settings = Record<string, unknown>;
+type ProviderProtocol = "openai-completions" | "openai-responses" | "anthropic-messages";
 
-const SERVER_BIND_HOST = process.env.DS4_HOST ?? "127.0.0.1";
+function settingsKeyForEnv(envName: string): string {
+	const withoutPrefix = envName.replace(/^DS4_/, "").toLowerCase();
+	return withoutPrefix.replace(/_([a-z])/g, (_match, char: string) => char.toUpperCase());
+}
+
+function readSettingsSync(): Ds4Settings {
+	try {
+		const parsed = JSON.parse(readFileSync(SETTINGS_FILE, "utf8"));
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Ds4Settings;
+		throw new Error("settings root must be a JSON object");
+	} catch (error: any) {
+		if (error?.code === "ENOENT") return {};
+		throw new Error(`Failed to read ${SETTINGS_FILE}: ${describeError(error)}`);
+	}
+}
+
+const DS4_SETTINGS = readSettingsSync();
+
+function settingValue(envName: string): unknown {
+	if (process.env[envName] !== undefined) return process.env[envName];
+	const snakeKey = envName.replace(/^DS4_/, "").toLowerCase();
+	const keys = [envName, settingsKeyForEnv(envName), envName.toLowerCase(), snakeKey];
+	for (const key of keys) {
+		if (Object.prototype.hasOwnProperty.call(DS4_SETTINGS, key)) return DS4_SETTINGS[key];
+	}
+	return undefined;
+}
+
+function configString(envName: string, defaultValue?: string): string | undefined {
+	const value = settingValue(envName);
+	if (value === undefined || value === null) return defaultValue;
+	if (typeof value === "string") return value;
+	if (typeof value === "number" || typeof value === "boolean") return String(value);
+	throw new Error(`${envName} must be a string in the environment or ${SETTINGS_FILE}`);
+}
+
+function configNumber(envName: string, defaultValue: number): number {
+	const value = settingValue(envName);
+	if (value === undefined || value === null || value === "") return defaultValue;
+	const number = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+	if (!Number.isFinite(number)) throw new Error(`${envName} must be a finite number in the environment or ${SETTINGS_FILE}`);
+	return number;
+}
+
+function selectedProtocol(): ProviderProtocol {
+	const raw = configString("DS4_PROTOCOL", "openai")?.toLowerCase();
+	switch (raw) {
+		case "openai":
+		case "openai-completions":
+		case "chat":
+		case "chat-completions":
+			return "openai-completions";
+		case "responses":
+		case "openai-responses":
+			return "openai-responses";
+		case "anthropic":
+		case "anthropic-messages":
+		case "messages":
+			return "anthropic-messages";
+		default:
+			throw new Error(`Invalid DS4_PROTOCOL=${raw}; expected openai, openai-responses, or anthropic`);
+	}
+}
+
+const SUPPORT_REPO = configString("DS4_SUPPORT_REPO", "https://github.com/antirez/ds4")!;
+const SUPPORT_BRANCH = configString("DS4_SUPPORT_BRANCH", "main")!;
+
+
+const SERVER_BIND_HOST = configString("DS4_HOST", "127.0.0.1")!;
 const SERVER_CLIENT_HOST = SERVER_BIND_HOST === "0.0.0.0" ? "127.0.0.1" : SERVER_BIND_HOST;
 const DEFAULT_SERVER_PORT = 8000;
-const AUTO_PORT_SCAN_COUNT = parseScanCount(process.env.DS4_AUTO_PORT_SCAN_COUNT);
+const AUTO_PORT_SCAN_COUNT = parseScanCount(configString("DS4_AUTO_PORT_SCAN_COUNT"));
 
 // Token context size for the ds4-server KV cache. Must match the model's
 // trained context window. Both the server arg and pi's model registration
@@ -103,7 +174,7 @@ function isPortListeningSync(port: number): boolean {
 }
 
 function selectedServerPort(): number {
-	const forcedPort = parsePort(process.env.DS4_PORT, "DS4_PORT");
+	const forcedPort = parsePort(configString("DS4_PORT"), "DS4_PORT");
 	if (forcedPort) return forcedPort;
 
 	const managedPort = managedStatePortSync();
@@ -118,12 +189,18 @@ function selectedServerPort(): number {
 	);
 }
 
+const PROVIDER_API = selectedProtocol();
 let SERVER_PORT = selectedServerPort();
 let BASE_URL = `http://${SERVER_CLIENT_HOST}:${SERVER_PORT}`;
 let API_BASE_URL = `${BASE_URL}/v1`;
+let PROVIDER_BASE_URL = providerBaseUrl();
 let SERVER_ARGS = serverArgsForPort(SERVER_PORT);
 
-function serverArgsForPort(port: number, modelPath?: string): string[] {
+function providerBaseUrl(): string {
+	return PROVIDER_API === "anthropic-messages" ? BASE_URL : API_BASE_URL;
+}
+
+function serverArgsForPort(port: number, modelQuant?: ModelQuant, modelPath?: string): string[] {
 	const args = [
 		"--host",
 		SERVER_BIND_HOST,
@@ -132,7 +209,7 @@ function serverArgsForPort(port: number, modelPath?: string): string[] {
 		"--ctx",
 		String(DS4_CTX),
 		"--kv-disk-dir",
-		KV_DIR,
+		modelQuant ? kvDirForQuant(modelQuant) : KV_DIR,
 		"--kv-disk-space-mb",
 		"8192",
 	];
@@ -143,22 +220,21 @@ function configureServerPort(port: number): void {
 	SERVER_PORT = port;
 	BASE_URL = `http://${SERVER_CLIENT_HOST}:${SERVER_PORT}`;
 	API_BASE_URL = `${BASE_URL}/v1`;
+	PROVIDER_BASE_URL = providerBaseUrl();
 	SERVER_ARGS = serverArgsForPort(SERVER_PORT);
 }
 
 function stateMatchesSelectedPortAndQuant(state: ServerState, modelQuant: ModelQuant): boolean {
-	if (portFromBaseUrl(state.baseUrl) !== SERVER_PORT) return false;
-	// Older pi-ds4 state did not record the quant. Treat it as compatible so
-	// existing managed servers are not needlessly interrupted mid-session.
-	return !state.modelQuant || state.modelQuant === modelQuant;
+	return portFromBaseUrl(state.baseUrl) === SERVER_PORT && serverStateMatchesQuant(state, modelQuant);
 }
+
 
 const HEARTBEAT_MS = 10_000;
 const LEASE_TTL_MS = 45_000;
 const LOCK_STALE_MS = 60_000;
 const LOCK_TIMEOUT_MS = 30_000;
 const STARTUP_LOCK_TIMEOUT_MS = 24 * 60 * 60_000;
-const READY_TIMEOUT_MS = Number(process.env.DS4_READY_TIMEOUT_MS ?? 10 * 60_000);
+const READY_TIMEOUT_MS = configNumber("DS4_READY_TIMEOUT_MS", 10 * 60_000);
 const HTTP_CHECK_TIMEOUT_MS = 1_500;
 const SHUTDOWN_GRACE_MS = 60_000;
 const LOG_TAIL_BYTES = 256 * 1024;
@@ -168,7 +244,9 @@ const WATCHDOG_POLL_MS = 2_000;
 const PROGRESS_NOTIFY_MS = 750;
 const PROGRESS_MAX_CHARS = 160;
 
+
 type ModelQuant = "q2" | "q2-imatrix" | "q4" | "q4-imatrix";
+
 
 type ServerState = {
 	managedBy: string;
@@ -179,8 +257,12 @@ type ServerState = {
 	args: string[];
 	startedAt: number;
 	startedAtIso: string;
+
+	modelId?: string;
 	modelQuant?: ModelQuant;
 	modelPath?: string;
+	kvDir?: string;
+
 	stopping?: boolean;
 	stoppingAt?: number;
 	stoppingAtIso?: string;
@@ -214,8 +296,9 @@ type LogTheme = { fg: (color: ThemeColor, text: string) => string };
 type Component = { render(width: number): string[]; handleInput?(data: string): void; invalidate(): void };
 
 const WATCHDOG_SCRIPT_NAME = "ds4-watchdog.sh";
-const WATCHDOG_SCRIPT = process.env.DS4_WATCHDOG_SCRIPT
-	? resolve(process.env.DS4_WATCHDOG_SCRIPT)
+const WATCHDOG_SCRIPT_CONFIG = configString("DS4_WATCHDOG_SCRIPT");
+const WATCHDOG_SCRIPT = WATCHDOG_SCRIPT_CONFIG
+	? resolve(WATCHDOG_SCRIPT_CONFIG)
 	: join(EXTENSION_DIR, WATCHDOG_SCRIPT_NAME);
 
 let heartbeat: ReturnType<typeof setInterval> | undefined;
@@ -290,10 +373,12 @@ function truncateText(value: string, width: number, ellipsis = "", pad = false):
 	return pad ? text + " ".repeat(Math.max(0, width - text.length)) : text;
 }
 
-function selectedModelQuant(): ModelQuant {
-	const forced = process.env.DS4_MODEL_QUANT?.toLowerCase();
+
+function selectedDefaultModelQuant(): ModelQuant {
+	const forced = configString("DS4_MODEL_QUANT")?.toLowerCase();
 	if (forced === "q2" || forced === "q2-imatrix" || forced === "q4" || forced === "q4-imatrix") return forced;
 	if (forced) throw new Error(`Invalid DS4_MODEL_QUANT=${forced}; expected q2, q2-imatrix, q4 or q4-imatrix`);
+
 
 	const ramGb = totalmem() / 1_000_000_000;
 	if (ramGb >= 256) return "q4-imatrix";
@@ -305,13 +390,44 @@ function selectedModelQuant(): ModelQuant {
 
 function modelQuantForModelId(modelId: string | undefined): ModelQuant | undefined {
 	if (modelId === Q2_IMATRIX_MODEL_ID) return "q2-imatrix";
-	if (modelId === MODEL_ID) return selectedModelQuant();
+
+	if (modelId === MODEL_ID) return selectedDefaultModelQuant();
 	return undefined;
 }
+
+function modelIdForQuant(modelQuant: ModelQuant): string {
+	return modelQuant === "q2-imatrix" ? Q2_IMATRIX_MODEL_ID : MODEL_ID;
+}
+
+function kvDirForQuant(modelQuant: ModelQuant): string {
+	switch (modelQuant) {
+		case "q2-imatrix":
+			return join(DS4_DIR, "kv-q2-imatrix");
+		case "q4-imatrix":
+			return join(DS4_DIR, "kv-q4-imatrix");
+		default:
+			return KV_DIR;
+	}
+}
+
+function serverArgsForModel(modelQuant: ModelQuant, modelPath: string): string[] {
+	return serverArgsForPort(SERVER_PORT, modelQuant, modelPath);
+}
+
+function serverStateMatchesQuant(state: ServerState | undefined, modelQuant: ModelQuant): boolean {
+	if (!state) return false;
+	if (state.modelQuant) return state.modelQuant === modelQuant;
+	// Older pi-ds4 installs did not record the quant. Treat them as matching the
+	// historical non-imatrix choices, but never an explicit/default imatrix choice.
+	return modelQuant === "q2" || modelQuant === "q4";
+}
+
 
 async function ensureDirs(): Promise<void> {
 	await mkdir(CLIENT_DIR, { recursive: true });
 	await mkdir(KV_DIR, { recursive: true });
+	await mkdir(kvDirForQuant("q2-imatrix"), { recursive: true });
+	await mkdir(kvDirForQuant("q4-imatrix"), { recursive: true });
 }
 
 async function readJson<T>(file: string): Promise<T | undefined> {
@@ -908,7 +1024,7 @@ async function ensureSupportCheckout(onStatus?: StatusCallback): Promise<string>
 async function resolveRuntimeDirLocked(onStatus?: StatusCallback): Promise<string> {
 	if (resolvedRuntimeDir) return resolvedRuntimeDir;
 
-	const forced = process.env.DS4_RUNTIME_DIR;
+	const forced = configString("DS4_RUNTIME_DIR");
 	if (forced) {
 		const dir = resolve(forced);
 		if (!(await isDs4Checkout(dir))) throw new Error(`DS4_RUNTIME_DIR=${dir} is not a ds4 checkout`);
@@ -1014,7 +1130,7 @@ async function restartManagedServer(runtimeDir: string, onStatus?: StatusCallbac
 		await clearState();
 	}
 
-	const modelQuant = state?.modelQuant ?? selectedModelQuant();
+	const modelQuant = state?.modelQuant ?? selectedDefaultModelQuant();
 	const modelPath = await ensureModel(runtimeDir, modelQuant, onStatus);
 	await startServerLocked(runtimeDir, modelQuant, modelPath);
 	await waitForServerReady(onStatus);
@@ -1203,16 +1319,6 @@ async function clearState(): Promise<void> {
 	await removeFile(STATE_FILE);
 }
 
-async function stopServerPidLocked(pid: number, label: string, onStatus?: StatusCallback): Promise<void> {
-	onStatus?.(label);
-	process.kill(pid, "SIGTERM");
-	if (!(await waitForPidExit(pid, SHUTDOWN_GRACE_MS))) {
-		process.kill(pid, "SIGKILL");
-		await waitForPidExit(pid, 5_000);
-	}
-	await clearState();
-}
-
 async function checkHttpReady(): Promise<boolean> {
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), HTTP_CHECK_TIMEOUT_MS);
@@ -1235,13 +1341,59 @@ async function waitForPidExit(pid: number, timeoutMs: number): Promise<boolean> 
 	return !isPidAlive(pid);
 }
 
-async function waitForServerReady(onStatus?: StatusCallback): Promise<void> {
+async function checkHttpReadyForQuant(modelQuant: ModelQuant): Promise<boolean> {
+	if (!(await checkHttpReady())) return false;
+	return serverStateMatchesQuant(await readState(), modelQuant);
+}
+
+async function stopServerPidLocked(pid: number, reason: string, onStatus?: StatusCallback): Promise<void> {
+	onStatus?.(reason);
+	const previous = await readState();
+	const now = Date.now();
+	await writeJsonAtomic(STATE_FILE, {
+		...(previous ?? {
+			managedBy: MANAGED_BY,
+			pid,
+			baseUrl: API_BASE_URL,
+			cwd: SUPPORT_DIR,
+			binary: "ds4-server",
+			args: [],
+			startedAt: now,
+			startedAtIso: new Date(now).toISOString(),
+		}),
+		pid,
+		stopping: true,
+		stoppingAt: now,
+		stoppingAtIso: new Date(now).toISOString(),
+	});
+
+	await appendLog(`\n[${new Date().toISOString()}] ${reason}; stopping ds4-server pid=${pid}\n`);
+	try {
+		process.kill(pid, "SIGTERM");
+	} catch (error: any) {
+		if (error?.code !== "ESRCH") throw error;
+	}
+
+	if (!(await waitForPidExit(pid, SHUTDOWN_GRACE_MS))) {
+		await appendLog(`[${new Date().toISOString()}] ds4-server pid=${pid} still alive; sending SIGKILL\n`);
+		try {
+			process.kill(pid, "SIGKILL");
+		} catch {}
+		await waitForPidExit(pid, 5_000);
+	}
+
+	if (isPidAlive(pid)) throw new Error(`ds4-server pid ${pid} did not exit`);
+	await clearState();
+	await appendLog(`[${new Date().toISOString()}] ds4-server pid=${pid} stopped\n`);
+}
+
+async function waitForServerReady(modelQuant: ModelQuant, onStatus?: StatusCallback): Promise<void> {
 	const started = Date.now();
 	let lastStatus = 0;
 
 	while (Date.now() - started < READY_TIMEOUT_MS) {
 		if (runtimeDisposed || shuttingDown) return;
-		if (await checkHttpReady()) return;
+		if (await checkHttpReadyForQuant(modelQuant)) return;
 
 		const state = await readState();
 		if (state?.pid && !isPidAlive(state.pid)) {
@@ -1260,24 +1412,36 @@ async function waitForServerReady(onStatus?: StatusCallback): Promise<void> {
 }
 
 async function startServerLocked(runtimeDir: string, modelQuant: ModelQuant, modelPath: string): Promise<void> {
+
 	const listeningPids = await listeningPidsOnServerPort();
 	if (listeningPids.length > 0) {
 		const ds4Pid = await findListeningDs4ServerPid();
 		if (ds4Pid) {
-			await writeAdoptedServerStateLocked(ds4Pid);
-			return;
+			if (modelQuant === "q2-imatrix" || modelQuant === "q4-imatrix") {
+				await stopServerPidLocked(ds4Pid, `replace existing ds4-server with ${modelQuant}`);
+			} else {
+				await writeAdoptedServerStateLocked(ds4Pid);
+				return;
+			}
+		} else {
+			throw new Error(`Cannot start ds4-server: ${BASE_URL} is already in use by pid(s) ${listeningPids.join(", ")}`);
 		}
-		throw new Error(`Cannot start ds4-server: ${BASE_URL} is already in use by pid(s) ${listeningPids.join(", ")}`);
 	}
 
-	const binary = process.env.DS4_SERVER_BINARY ?? join(runtimeDir, "ds4-server");
+	const binary = configString("DS4_SERVER_BINARY") ?? join(runtimeDir, "ds4-server");
+
 	try {
 		await access(binary, constants.X_OK);
 	} catch {
 		throw new Error(`Cannot execute ds4-server at ${binary}`);
 	}
 
-	const serverArgs = serverArgsForPort(SERVER_PORT, modelPath);
+
+	const kvDir = kvDirForQuant(modelQuant);
+	await mkdir(kvDir, { recursive: true });
+	const serverArgs = serverArgsForModel(modelQuant, modelPath);
+
+
 	await appendLog(`\n[${new Date().toISOString()}] start ds4-server (${modelQuant})\n$ ${[binary, ...serverArgs].map(shellQuote).join(" ")}\n`);
 	const logFd = openSync(LOG_FILE, "a");
 	let childPid: number | undefined;
@@ -1304,8 +1468,12 @@ async function startServerLocked(runtimeDir: string, modelQuant: ModelQuant, mod
 		cwd: runtimeDir,
 		binary,
 		args: serverArgs,
+
+		modelId: modelIdForQuant(modelQuant),
 		modelQuant,
 		modelPath,
+		kvDir,
+
 		startedAt: now,
 		startedAtIso: new Date(now).toISOString(),
 	};
@@ -1325,25 +1493,33 @@ async function ensureServerManagedInner(modelQuant: ModelQuant, onStatus?: Statu
 
 		const state = await readState();
 		if (state?.pid && isPidAlive(state.pid) && (await looksLikeDs4Server(state.pid))) {
-			if (stateMatchesSelectedPortAndQuant(state, modelQuant)) {
-				if (state.stopping) stoppingPid = state.pid;
+
+			if (state.stopping) {
+				stoppingPid = state.pid;
 				return;
 			}
+			if (stateMatchesSelectedPortAndQuant(state, modelQuant)) return;
 			if (portFromBaseUrl(state.baseUrl) === SERVER_PORT) {
-				await stopServerPidLocked(state.pid, `switching ds4-server to ${modelQuant} model`, onStatus);
+				await stopServerPidLocked(state.pid, `switch ds4-server to ${modelQuant}`, onStatus);
 			} else {
 				throw new Error(`A managed ds4-server is already running at ${state.baseUrl}; stop it before switching to ${API_BASE_URL}`);
 			}
+
 		}
 
 		if (state?.pid) await clearState();
 		if (await checkHttpReady()) {
 			const pid = await findListeningDs4ServerPid();
 			if (pid) {
-				await writeAdoptedServerStateLocked(pid);
-				return;
+				if (modelQuant === "q2-imatrix" || modelQuant === "q4-imatrix") {
+					await stopServerPidLocked(pid, `replace unknown ds4-server with ${modelQuant}`, onStatus);
+				} else {
+					await writeAdoptedServerStateLocked(pid);
+					return;
+				}
+			} else {
+				throw new Error(`Refusing to use ${API_BASE_URL}: it is not a ds4-server process`);
 			}
-			throw new Error(`Refusing to use ${API_BASE_URL}: it is not a ds4-server process`);
 		}
 		if (runtimeDisposed || shuttingDown) return;
 
@@ -1368,7 +1544,7 @@ async function ensureServerManagedInner(modelQuant: ModelQuant, onStatus?: Statu
 		return ensureServerManagedInner(modelQuant, onStatus);
 	}
 
-	await waitForServerReady(onStatus);
+	await waitForServerReady(modelQuant, onStatus);
 }
 
 function ensureServerManaged(modelQuant: ModelQuant, onStatus?: StatusCallback): Promise<void> {
@@ -1392,6 +1568,14 @@ async function stopServerIfUnused(): Promise<void> {
 	// The watchdog owns lease refcounting and server shutdown.  Keep /quit fast:
 	// removing our lease is enough for it to stop ds4-server when nobody else is using it.
 	await removeOwnLease();
+}
+
+function registerDs4Skill(pi: ExtensionAPI): void {
+	pi.on("resources_discover", () => {
+		return {
+			skillPaths: [join(EXTENSION_DIR, "pi-ds4-config", "SKILL.md")],
+		};
+	});
 }
 
 function registerDs4Command(pi: ExtensionAPI): void {
@@ -1488,12 +1672,31 @@ function registerDs4Command(pi: ExtensionAPI): void {
 	});
 }
 
+function ds4Model(id: string, name: string) {
+	return {
+		id,
+		name,
+		reasoning: true,
+		thinkingLevelMap: {
+			minimal: "low",
+			low: "low",
+			medium: "medium",
+			high: "high",
+			xhigh: "xhigh",
+		},
+		input: ["text"],
+		contextWindow: DS4_CTX,
+		maxTokens: DS4_CTX,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	};
+}
+
 function registerDs4Provider(pi: ExtensionAPI): void {
 	pi.registerProvider(PROVIDER_ID, {
 		name: "ds4.c local",
-		baseUrl: API_BASE_URL,
-		api: "openai-completions",
-		apiKey: "dsv4-local",
+		baseUrl: PROVIDER_BASE_URL,
+		api: PROVIDER_API,
+		apiKey: configString("DS4_API_KEY", "dsv4-local"),
 		compat: {
 			supportsStore: false,
 			supportsDeveloperRole: false,
@@ -1503,40 +1706,13 @@ function registerDs4Provider(pi: ExtensionAPI): void {
 			supportsStrictMode: false,
 			thinkingFormat: "deepseek",
 			requiresReasoningContentOnAssistantMessages: true,
+			...(PROVIDER_API === "anthropic-messages" ? { supportsEagerToolInputStreaming: false } : {}),
 		},
 		models: [
-			{
-				id: MODEL_ID,
-				name: "DeepSeek V4 Flash (ds4.c local, auto quant)",
-				reasoning: true,
-				thinkingLevelMap: {
-					minimal: "low",
-					low: "low",
-					medium: "medium",
-					high: "high",
-					xhigh: "xhigh",
-				},
-				input: ["text"],
-				contextWindow: DS4_CTX,
-				maxTokens: DS4_CTX,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			},
-			{
-				id: Q2_IMATRIX_MODEL_ID,
-				name: "DeepSeek V4 Flash q2 imatrix (ds4.c local)",
-				reasoning: true,
-				thinkingLevelMap: {
-					minimal: "low",
-					low: "low",
-					medium: "medium",
-					high: "high",
-					xhigh: "xhigh",
-				},
-				input: ["text"],
-				contextWindow: DS4_CTX,
-				maxTokens: DS4_CTX,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			},
+
+			ds4Model(MODEL_ID, "DeepSeek V4 Flash (ds4.c local, auto quant)"),
+			ds4Model(Q2_IMATRIX_MODEL_ID, "DeepSeek V4 Flash q2 imatrix (ds4.c local)"),
+
 		],
 	} as any);
 }
@@ -1548,12 +1724,13 @@ export default function (pi: ExtensionAPI) {
 	leaseActive = false;
 	watchdogStarted = false;
 	startupPromise = undefined;
-	activeSetupChild = undefined;
 	startupModelQuant = undefined;
+	activeSetupChild = undefined;
 	resolvedRuntimeDir = undefined;
 
 	registerDs4Provider(pi);
 	registerDs4Command(pi);
+	registerDs4Skill(pi);
 
 	pi.on("before_provider_request", async (_event, ctx) => {
 		if (ctx.model?.provider !== PROVIDER_ID) return;
@@ -1566,6 +1743,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (!modelQuant) return;
 
+
 		// The watchdog is launched with the selected port and supervises that port
 		// for the lifetime of this extension instance. Re-select only before it
 		// starts; hot-swapping ports would leave the watchdog supervising stale state.
@@ -1577,7 +1755,8 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
-		const alreadyReady = await checkHttpReady();
+
+		const alreadyReady = await checkHttpReadyForQuant(modelQuant);
 		let lastNotification: string | undefined;
 		const notifyStatus: StatusCallback | undefined = alreadyReady
 			? undefined

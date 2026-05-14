@@ -19,6 +19,9 @@
     "index.ts",
     "ds4-watchdog.sh",
     "install-pi-extension-local.sh",
+    "settings.example.json",
+    "settings.schema.json",
+    "pi-ds4-config/SKILL.md",
     "README.md",
     "LICENSE"
   ],

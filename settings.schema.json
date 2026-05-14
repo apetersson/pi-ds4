@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mitsuhiko/pi-ds4/main/settings.schema.json",
+  "title": "pi-ds4 settings",
+  "description": "Configuration for ~/.pi/ds4/settings.json. Environment variables with the same names override these values.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+
+    "protocol": { "$ref": "#/$defs/protocol" },
+    "DS4_PROTOCOL": { "$ref": "#/$defs/protocol" },
+    "ds4_protocol": { "$ref": "#/$defs/protocol" },
+
+    "apiKey": { "$ref": "#/$defs/nullableString" },
+    "api_key": { "$ref": "#/$defs/nullableString" },
+    "DS4_API_KEY": { "$ref": "#/$defs/nullableString" },
+    "ds4_api_key": { "$ref": "#/$defs/nullableString" },
+
+    "supportRepo": { "$ref": "#/$defs/nullableString" },
+    "support_repo": { "$ref": "#/$defs/nullableString" },
+    "DS4_SUPPORT_REPO": { "$ref": "#/$defs/nullableString" },
+    "ds4_support_repo": { "$ref": "#/$defs/nullableString" },
+
+    "supportBranch": { "$ref": "#/$defs/nullableString" },
+    "support_branch": { "$ref": "#/$defs/nullableString" },
+    "DS4_SUPPORT_BRANCH": { "$ref": "#/$defs/nullableString" },
+    "ds4_support_branch": { "$ref": "#/$defs/nullableString" },
+
+    "runtimeDir": { "$ref": "#/$defs/nullableString" },
+    "runtime_dir": { "$ref": "#/$defs/nullableString" },
+    "DS4_RUNTIME_DIR": { "$ref": "#/$defs/nullableString" },
+    "ds4_runtime_dir": { "$ref": "#/$defs/nullableString" },
+
+    "modelQuant": { "$ref": "#/$defs/modelQuant" },
+    "model_quant": { "$ref": "#/$defs/modelQuant" },
+    "DS4_MODEL_QUANT": { "$ref": "#/$defs/modelQuant" },
+    "ds4_model_quant": { "$ref": "#/$defs/modelQuant" },
+
+    "readyTimeoutMs": { "$ref": "#/$defs/nullableNumber" },
+    "ready_timeout_ms": { "$ref": "#/$defs/nullableNumber" },
+    "DS4_READY_TIMEOUT_MS": { "$ref": "#/$defs/nullableNumber" },
+    "ds4_ready_timeout_ms": { "$ref": "#/$defs/nullableNumber" },
+
+    "serverBinary": { "$ref": "#/$defs/nullableString" },
+    "server_binary": { "$ref": "#/$defs/nullableString" },
+    "DS4_SERVER_BINARY": { "$ref": "#/$defs/nullableString" },
+    "ds4_server_binary": { "$ref": "#/$defs/nullableString" },
+
+    "watchdogScript": { "$ref": "#/$defs/nullableString" },
+    "watchdog_script": { "$ref": "#/$defs/nullableString" },
+    "DS4_WATCHDOG_SCRIPT": { "$ref": "#/$defs/nullableString" },
+    "ds4_watchdog_script": { "$ref": "#/$defs/nullableString" }
+  },
+  "$defs": {
+    "nullableString": {
+      "type": ["string", "null"]
+    },
+    "nullableNumber": {
+      "type": ["number", "string", "null"],
+      "description": "Number of milliseconds. Strings must parse as finite numbers."
+    },
+    "protocol": {
+      "type": ["string", "null"],
+      "enum": [
+        "openai",
+        "openai-completions",
+        "chat",
+        "chat-completions",
+        "responses",
+        "openai-responses",
+        "anthropic",
+        "anthropic-messages",
+        "messages",
+        null
+      ]
+    },
+    "modelQuant": {
+      "type": ["string", "null"],
+      "enum": ["q2", "q2-imatrix", "q4", null]
+    }
+  }
+}
